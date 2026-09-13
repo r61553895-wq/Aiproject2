@@ -1,0 +1,6 @@
+{
+  "name": "GROKSON",
+  "description": "Премиальный AI-ассистент GROKSON с безопасным серверным API, системой 20 000 бесплатных токенов, админ-панелью и поддержкой GitHub Pages.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
