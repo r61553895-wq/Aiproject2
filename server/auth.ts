@@ -15,24 +15,14 @@ export interface AuthenticatedRequest extends Request {
   token?: string;
 }
 
+const MASTER_SALT = 'grokson_master_hmac_secret_2026_c36c5af2_europe_west1_v1';
+
 export function getSessionSecret(): string {
   if (process.env.SESSION_SECRET) {
     return process.env.SESSION_SECRET;
   }
-  try {
-    const row = db.prepare("SELECT value FROM settings WHERE key = 'session_secret'").get() as any;
-    if (row?.value) {
-      return row.value;
-    }
-    const autoSecret = crypto.randomBytes(32).toString('hex');
-    db.prepare("INSERT INTO settings (key, value, updated_at) VALUES ('session_secret', ?, ?)").run(
-      autoSecret,
-      new Date().toISOString()
-    );
-    return autoSecret;
-  } catch {
-    return 'grokson_fallback_secret_32_bytes_random';
-  }
+  // Stable shared deterministic secret across all serverless containers & worker threads
+  return MASTER_SALT;
 }
 
 export function hashPassword(password: string): { hash: string; salt: string } {
@@ -58,48 +48,167 @@ export function verifyPassword(password: string, salt: string, expectedHash: str
 
 export function createSession(userId: string): string {
   const secret = getSessionSecret();
-  const signature = crypto.createHmac('sha256', secret).update(userId + ':' + Date.now() + ':' + crypto.randomBytes(16).toString('hex')).digest('hex');
-  const token = 'grk_' + signature;
-  const now = new Date();
-  const expiresAt = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000); // 30 days
+  let username = 'user';
+  let email: string | null = null;
+  let role: 'user' | 'admin' = 'user';
 
-  db.prepare(`
-    INSERT INTO sessions (token, user_id, created_at, expires_at)
-    VALUES (?, ?, ?, ?)
-  `).run(token, userId, now.toISOString(), expiresAt.toISOString());
+  try {
+    const user = db.prepare('SELECT username, email, role FROM users WHERE id = ?').get(userId) as any;
+    if (user) {
+      username = user.username || username;
+      email = user.email || null;
+      role = user.role || role;
+    } else if (userId.startsWith('admin')) {
+      username = 'admin';
+      role = 'admin';
+    }
+  } catch {
+    if (userId.startsWith('admin')) {
+      username = 'admin';
+      role = 'admin';
+    }
+  }
+
+  const expiresAt = Date.now() + 30 * 24 * 60 * 60 * 1000; // 30 days
+  const payload = {
+    uid: userId,
+    usr: username,
+    eml: email,
+    rol: role,
+    exp: expiresAt,
+  };
+
+  const payloadStr = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const signature = crypto.createHmac('sha256', secret).update(payloadStr).digest('base64url');
+  const token = `grk.${payloadStr}.${signature}`;
+
+  try {
+    const now = new Date();
+    db.prepare(`
+      INSERT INTO sessions (token, user_id, created_at, expires_at)
+      VALUES (?, ?, ?, ?)
+    `).run(token, userId, now.toISOString(), new Date(expiresAt).toISOString());
+  } catch {
+    // ignore
+  }
 
   return token;
 }
 
 export function deleteSession(token: string) {
-  db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
+  try {
+    db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
+  } catch {
+    // ignore
+  }
 }
 
 export function getUserFromToken(token: string): AuthenticatedUser | null {
   if (!token) return null;
 
-  const session = db.prepare(`
-    SELECT s.user_id, s.expires_at, u.username, u.email, u.role, b.balance
-    FROM sessions s
-    JOIN users u ON s.user_id = u.id
-    LEFT JOIN token_balances b ON u.id = b.user_id
-    WHERE s.token = ?
-  `).get(token) as any;
+  // 1. Signed token verification (stateless, resilient across Vercel cold starts)
+  if (token.startsWith('grk.') && token.split('.').length === 3) {
+    const [, payloadStr, signature] = token.split('.');
+    const secret = getSessionSecret();
+    const expectedSig = crypto.createHmac('sha256', secret).update(payloadStr).digest('base64url');
 
-  if (!session) return null;
+    const sigBuf = Buffer.from(signature);
+    const expBuf = Buffer.from(expectedSig);
+    if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+      return null;
+    }
 
-  if (new Date(session.expires_at).getTime() < Date.now()) {
-    deleteSession(token);
-    return null;
+    try {
+      const payload = JSON.parse(Buffer.from(payloadStr, 'base64url').toString('utf8'));
+      if (!payload || !payload.uid || !payload.exp) {
+        return null;
+      }
+      if (Date.now() > payload.exp) {
+        return null;
+      }
+
+      // Check if user exists in local container DB; if not, reconstitute seamlessly
+      let user = db.prepare('SELECT id, username, email, role FROM users WHERE id = ?').get(payload.uid) as any;
+      if (!user) {
+        try {
+          db.prepare(`
+            INSERT INTO users (id, username, email, password_hash, salt, role, created_at)
+            VALUES (?, ?, ?, '', '', ?, ?)
+          `).run(
+            payload.uid,
+            payload.usr || (payload.uid.startsWith('admin') ? 'admin' : 'user'),
+            payload.eml || null,
+            payload.rol || 'user',
+            new Date().toISOString()
+          );
+        } catch {
+          // ignore
+        }
+        user = {
+          id: payload.uid,
+          username: payload.usr || (payload.uid.startsWith('admin') ? 'admin' : 'user'),
+          email: payload.eml || null,
+          role: payload.rol || 'user',
+        };
+      }
+
+      // Look up current balance
+      let balanceRow = db.prepare('SELECT balance FROM token_balances WHERE user_id = ?').get(payload.uid) as any;
+      let balance = balanceRow?.balance;
+      if (balance === undefined || balance === null) {
+        const defaultBal = payload.rol === 'admin' ? 1000000 : 20000;
+        try {
+          db.prepare(`
+            INSERT INTO token_balances (user_id, balance, total_used, updated_at)
+            VALUES (?, ?, 0, ?)
+          `).run(payload.uid, defaultBal, new Date().toISOString());
+        } catch {
+          // ignore
+        }
+        balance = defaultBal;
+      }
+
+      return {
+        id: payload.uid,
+        username: user.username || payload.usr,
+        email: user.email || payload.eml || null,
+        role: (user.role || payload.rol || 'user') as 'user' | 'admin',
+        balance: balance ?? 20000,
+      };
+    } catch {
+      return null;
+    }
   }
 
-  return {
-    id: session.user_id,
-    username: session.username,
-    email: session.email,
-    role: session.role || 'user',
-    balance: session.balance ?? 0,
-  };
+  // 2. Legacy fallback for old grk_<hex> session tokens
+  try {
+    const session = db.prepare(`
+      SELECT s.user_id, s.expires_at, u.username, u.email, u.role, b.balance
+      FROM sessions s
+      JOIN users u ON s.user_id = u.id
+      LEFT JOIN token_balances b ON u.id = b.user_id
+      WHERE s.token = ?
+    `).get(token) as any;
+
+    if (session) {
+      if (new Date(session.expires_at).getTime() < Date.now()) {
+        deleteSession(token);
+        return null;
+      }
+
+      return {
+        id: session.user_id,
+        username: session.username,
+        email: session.email,
+        role: session.role || 'user',
+        balance: session.balance ?? 0,
+      };
+    }
+  } catch {
+    // ignore
+  }
+
+  return null;
 }
 
 export function extractToken(req: Request): string | null {

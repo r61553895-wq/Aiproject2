@@ -171,7 +171,15 @@ router.post('/chat', requireAuth, async (req: AuthenticatedRequest, res: Respons
     if (sessionId) {
       const existingSession = db.prepare('SELECT id FROM chat_sessions WHERE id = ? AND user_id = ?').get(sessionId, userId);
       if (!existingSession) {
-        sessionId = undefined;
+        // Cold start recovery: recreate session in DB with the same ID
+        try {
+          db.prepare(`
+            INSERT INTO chat_sessions (id, user_id, title, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+          `).run(sessionId, userId, message.trim().slice(0, 35) || 'Диалог', now, now);
+        } catch {
+          // ignore
+        }
       }
     }
 

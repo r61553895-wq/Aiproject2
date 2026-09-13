@@ -46,8 +46,10 @@ export default function App() {
     try {
       const currentUser = await api.auth.getCurrentUser();
       setUser(currentUser);
-    } catch {
-      setUser(null);
+    } catch (err: any) {
+      if (err?.status === 401) {
+        setUser(null);
+      }
     } finally {
       setLoadingUser(false);
     }
