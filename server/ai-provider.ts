@@ -1,6 +1,6 @@
 import https from 'node:https';
 import crypto from 'node:crypto';
-import { db } from './db';
+import { db } from './db.js';
 import { GoogleGenAI } from '@google/genai';
 
 interface ChatMessageInput {

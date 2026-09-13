@@ -1,8 +1,8 @@
 import { Router, Response } from 'express';
 import crypto from 'node:crypto';
-import { db } from '../db';
-import { requireAuth, AuthenticatedRequest } from '../auth';
-import { generateAiResponse, estimateTokens } from '../ai-provider';
+import { db } from '../db.js';
+import { requireAuth, AuthenticatedRequest } from '../auth.js';
+import { generateAiResponse, estimateTokens } from '../ai-provider.js';
 
 const router = Router();
 

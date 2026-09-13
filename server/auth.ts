@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import { Request, Response, NextFunction } from 'express';
-import { db } from './db';
+import { db } from './db.js';
 
 export interface AuthenticatedUser {
   id: string;
@@ -42,8 +42,18 @@ export function hashPassword(password: string): { hash: string; salt: string } {
 }
 
 export function verifyPassword(password: string, salt: string, expectedHash: string): boolean {
-  const hash = crypto.pbkdf2Sync(password, salt, 10000, 64, 'sha512').toString('hex');
-  return crypto.timingSafeEqual(Buffer.from(hash, 'hex'), Buffer.from(expectedHash, 'hex'));
+  if (!password || !salt || !expectedHash) return false;
+  try {
+    const hash = crypto.pbkdf2Sync(password, salt, 10000, 64, 'sha512').toString('hex');
+    const bufA = Buffer.from(hash, 'hex');
+    const bufB = Buffer.from(expectedHash, 'hex');
+    if (bufA.length !== bufB.length) {
+      return false;
+    }
+    return crypto.timingSafeEqual(bufA, bufB);
+  } catch {
+    return false;
+  }
 }
 
 export function createSession(userId: string): string {

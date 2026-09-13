@@ -190,22 +190,22 @@ class UniversalStore {
       );
     }
 
-    // 2. SELECT u.id, u.username, u.email, u.password_hash, u.salt, u.role, b.balance FROM users u ...
-    if (upper.includes('ROLE = \'ADMIN\'')) {
-      if (params.length > 0 && params[0] !== undefined) {
-        const identifier = String(params[0] || '').toLowerCase();
-        const admin = this.data.users.find(
-          (u) =>
-            u.role === 'admin' &&
-            (u.username.toLowerCase() === identifier || (u.email && u.email.toLowerCase() === identifier))
-        );
-        return admin ? [admin] : [];
-      }
-      return this.data.users.filter((u) => u.role === 'admin');
+    // 2. Admin specific user query
+    if (upper.includes('FROM USERS') && upper.includes("ROLE = 'ADMIN'") && (upper.includes('USERNAME = ?') || upper.includes('EMAIL = ?'))) {
+      const identifier = String(params[0] || '').toLowerCase();
+      const admin = this.data.users.find(
+        (u) =>
+          u.role === 'admin' &&
+          (u.username.toLowerCase() === identifier || (u.email && u.email.toLowerCase() === identifier))
+      );
+      if (!admin) return [];
+      const balance = this.data.token_balances.find((b) => b.user_id === admin.id)?.balance ?? 1000000;
+      return [{ ...admin, balance }];
     }
 
-    if (upper.includes('FROM USERS U') && (upper.includes('U.USERNAME = ? OR U.EMAIL = ?') || upper.includes('(U.USERNAME = ? OR U.EMAIL = ?)'))) {
-      const identifier = (params[0] || '').toLowerCase();
+    // 3. General user lookup with token balance (Auth login & profile)
+    if (upper.includes('FROM USERS') && (upper.includes('USERNAME = ?') || upper.includes('EMAIL = ?'))) {
+      const identifier = String(params[0] || '').toLowerCase();
       const user = this.data.users.find(
         (u) =>
           u.username.toLowerCase() === identifier ||
@@ -216,13 +216,13 @@ class UniversalStore {
       return [{ ...user, balance }];
     }
 
-    // 3. SELECT * FROM users WHERE role = 'admin'
+    // 4. SELECT * FROM users WHERE role = 'admin'
     if (upper.includes('FROM USERS') && upper.includes("ROLE = 'ADMIN'")) {
       return this.data.users.filter((u) => u.role === 'admin');
     }
 
-    // 4. Admin Users list
-    if (upper.includes('FROM USERS U') && upper.includes('LEFT JOIN TOKEN_BALANCES B')) {
+    // 5. Admin Users list
+    if (upper.includes('FROM USERS') && upper.includes('TOKEN_BALANCES')) {
       return this.data.users.map((u) => {
         const b = this.data.token_balances.find((bal) => bal.user_id === u.id);
         return {
@@ -428,7 +428,25 @@ class UniversalStore {
 
     // INSERT INTO token_balances
     if (upper.includes('INSERT INTO TOKEN_BALANCES')) {
-      const [user_id, balance, total_granted, updated_at] = params;
+      let user_id = params[0];
+      let balance = 0;
+      let total_granted = 0;
+      let updated_at = new Date().toISOString();
+
+      if (params.length === 2) {
+        balance = upper.includes('1000000') ? 1000000 : 20000;
+        total_granted = balance;
+        updated_at = params[1] || updated_at;
+      } else if (params.length === 4) {
+        balance = Number(params[1]) || 0;
+        total_granted = Number(params[2]) || balance;
+        updated_at = params[3] || updated_at;
+      } else if (params.length >= 5) {
+        balance = Number(params[1]) || 0;
+        total_granted = Number(params[3]) || balance;
+        updated_at = params[4] || updated_at;
+      }
+
       const existing = this.data.token_balances.find((b) => b.user_id === user_id);
       if (existing) {
         existing.balance = balance;
@@ -599,46 +617,52 @@ class UniversalStore {
 export const db = new UniversalStore();
 
 export function initDatabase() {
-  // Check and seed default admin
-  const adminCheck = db.prepare("SELECT id FROM users WHERE role = 'admin' LIMIT 1").get();
-  if (!adminCheck) {
-    const adminLogin = process.env.ADMIN_LOGIN || 'admin';
-    const adminPass = process.env.ADMIN_PASSWORD || 'admin123';
-    const salt = crypto.randomBytes(16).toString('hex');
-    const hash = crypto.pbkdf2Sync(adminPass, salt, 10000, 64, 'sha512').toString('hex');
-    const adminId = 'admin_' + crypto.randomUUID();
-    const now = new Date().toISOString();
+  const seedAdminUser = (login: string, pass: string, email: string) => {
+    const existing = db.prepare("SELECT id FROM users WHERE username = ?").get(login);
+    if (!existing) {
+      const salt = crypto.randomBytes(16).toString('hex');
+      const hash = crypto.pbkdf2Sync(pass, salt, 10000, 64, 'sha512').toString('hex');
+      const adminId = 'admin_' + crypto.randomUUID();
+      const now = new Date().toISOString();
 
-    db.prepare(`
-      INSERT INTO users (id, username, email, password_hash, salt, role, created_at)
-      VALUES (?, ?, ?, ?, ?, 'admin', ?)
-    `).run(adminId, adminLogin, 'admin@grokson.ai', hash, salt, now);
+      db.prepare(`
+        INSERT INTO users (id, username, email, password_hash, salt, role, created_at)
+        VALUES (?, ?, ?, ?, ?, 'admin', ?)
+      `).run(adminId, login, email, hash, salt, now);
 
-    db.prepare(`
-      INSERT INTO token_balances (user_id, balance, total_used, total_granted, updated_at)
-      VALUES (?, 1000000, 0, 1000000, ?)
-    `).run(adminId, now);
+      db.prepare(`
+        INSERT INTO token_balances (user_id, balance, total_granted, updated_at)
+        VALUES (?, ?, ?, ?)
+      `).run(adminId, 1000000, 1000000, now);
 
-    db.prepare(`
-      INSERT INTO token_transactions (id, user_id, amount, type, description, created_at)
-      VALUES (?, ?, 1000000, 'ADMIN_GRANT', 'Начальный администраторский баланс', ?)
-    `).run(crypto.randomUUID(), adminId, now);
+      db.prepare(`
+        INSERT INTO token_transactions (id, user_id, amount, type, description, created_at)
+        VALUES (?, ?, 1000000, 'ADMIN_GRANT', 'Начальный администраторский баланс', ?)
+      `).run(crypto.randomUUID(), adminId, now);
+    }
+  };
 
-    // Seed promo codes
-    const seedPromo = (code: string, tokens: number, type: string, maxActs: number) => {
-      const codeCheck = db.prepare('SELECT id FROM promo_codes WHERE code = ?').get(code);
-      if (!codeCheck) {
-        db.prepare(`
-          INSERT INTO promo_codes (id, code, tokens, code_type, max_activations, current_activations, is_active, created_at)
-          VALUES (?, ?, ?, ?, ?, 0, 1, ?)
-        `).run(crypto.randomUUID(), code, tokens, type, maxActs, now);
-      }
-    };
-
-    seedPromo('GROK-2026-STARTER', 20000, 'multi', 500);
-    seedPromo('GROK-7F92-KD31', 10000, 'single', 1);
-    seedPromo('GROK-VIP-50000', 50000, 'single', 5);
+  // Seed default admin accounts
+  seedAdminUser('admin', process.env.ADMIN_PASSWORD || 'admin123', 'admin@grokson.ai');
+  const envLogin = process.env.ADMIN_LOGIN;
+  if (envLogin && envLogin.toLowerCase() !== 'admin') {
+    seedAdminUser(envLogin, process.env.ADMIN_PASSWORD || 'zxcqwerty', `${envLogin.toLowerCase()}@grokson.ai`);
   }
+
+  // Seed promo codes
+  const seedPromo = (code: string, tokens: number, type: string, maxActs: number) => {
+    const codeCheck = db.prepare('SELECT id FROM promo_codes WHERE code = ?').get(code);
+    if (!codeCheck) {
+      db.prepare(`
+        INSERT INTO promo_codes (id, code, tokens, code_type, max_activations, current_activations, is_active, created_at)
+        VALUES (?, ?, ?, ?, ?, 0, 1, ?)
+      `).run(crypto.randomUUID(), code, tokens, type, maxActs, new Date().toISOString());
+    }
+  };
+
+  seedPromo('GROK-2026-STARTER', 20000, 'multi', 500);
+  seedPromo('GROK-7F92-KD31', 10000, 'single', 1);
+  seedPromo('GROK-VIP-50000', 50000, 'single', 5);
 
   // Seed default settings
   const getSetting = db.prepare('SELECT value FROM settings WHERE key = ?');
