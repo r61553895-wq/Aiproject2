@@ -131,14 +131,18 @@ export function ChatPage({ user, onRefreshUser, onLogout, onNavigate }: ChatPage
     if (!customText) setInputText('');
     setErrorBanner(null);
 
-    // Optimistically add user message to list
-    const tempUserMsg: ChatMessageType = {
-      id: 'temp_' + Date.now(),
-      role: 'user',
-      content: textToSend,
-      created_at: new Date().toISOString(),
-    };
-    setMessages((prev) => [...prev, tempUserMsg]);
+    // Optimistically add user message to list only if not retrying
+    let tempId: string | null = null;
+    if (!customText) {
+      tempId = 'temp_' + Date.now();
+      const tempUserMsg: ChatMessageType = {
+        id: tempId,
+        role: 'user',
+        content: textToSend,
+        created_at: new Date().toISOString(),
+      };
+      setMessages((prev) => [...prev, tempUserMsg]);
+    }
     setGenerating(true);
 
     try {
@@ -164,6 +168,10 @@ export function ChatPage({ user, onRefreshUser, onLogout, onNavigate }: ChatPage
       await onRefreshUser();
     } catch (err: any) {
       console.error('Send error:', err);
+      if (tempId) {
+        // If error occurred on first send, restore text in input if empty
+        setInputText((prev) => (prev ? prev : textToSend));
+      }
       if (err.code === 'TOKENS_EXHAUSTED' || err.status === 403) {
         setShowExhaustedModal(true);
       } else {

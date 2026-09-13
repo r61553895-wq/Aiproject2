@@ -191,17 +191,32 @@ router.post('/chat', requireAuth, async (req: AuthenticatedRequest, res: Respons
     const promptTokensEst = estimateTokens(message);
     db.prepare(`
       INSERT INTO chat_messages (id, session_id, user_id, role, content, tokens_used, created_at)
-      VALUES (?, ?, ?, 'user', ?, ?, ?)
-    `).run(userMsgId, sessionId, userId, message.trim(), promptTokensEst, now);
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(userMsgId, sessionId, userId, 'user', message.trim(), promptTokensEst, now);
 
     // Retrieve conversation history for context (last 12 messages)
-    const historyRows = db.prepare(`
+    const rawHistory = db.prepare(`
       SELECT role, content
       FROM chat_messages
       WHERE session_id = ?
       ORDER BY created_at ASC
       LIMIT 12
     `).all(sessionId) as { role: 'user' | 'assistant' | 'system'; content: string }[];
+
+    const historyRows = (rawHistory && rawHistory.length > 0)
+      ? rawHistory.map((m) => {
+          if (m.role !== 'user' && m.role !== 'assistant' && m.role !== 'system') {
+            return {
+              role: 'user' as const,
+              content: String(m.role || m.content || message.trim()),
+            };
+          }
+          return {
+            role: m.role,
+            content: String(m.content ?? ''),
+          };
+        })
+      : [{ role: 'user' as const, content: message.trim() }];
 
     // 2. CALL AI PROVIDER (Abstraction)
     let aiResult;
@@ -243,8 +258,8 @@ router.post('/chat', requireAuth, async (req: AuthenticatedRequest, res: Respons
     const assistantMsgId = 'msg_' + crypto.randomUUID();
     db.prepare(`
       INSERT INTO chat_messages (id, session_id, user_id, role, content, tokens_used, created_at)
-      VALUES (?, ?, ?, 'assistant', ?, ?, ?)
-    `).run(assistantMsgId, sessionId, userId, aiResult.content, actualTokensUsed, now);
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(assistantMsgId, sessionId, userId, 'assistant', aiResult.content, actualTokensUsed, now);
 
     // Touch chat session updated_at
     db.prepare('UPDATE chat_sessions SET updated_at = ? WHERE id = ?').run(now, sessionId);

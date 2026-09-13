@@ -137,6 +137,25 @@ class UniversalStore {
         const raw = fs.readFileSync(this.filePath, 'utf-8');
         const parsed = JSON.parse(raw);
         this.data = { ...this.data, ...parsed };
+
+        // Auto-repair any malformed chat messages where role was accidentally stored as content
+        if (Array.isArray(this.data.chat_messages)) {
+          this.data.chat_messages = this.data.chat_messages.map((m: any) => {
+            if (m.role !== 'user' && m.role !== 'assistant' && m.role !== 'system') {
+              return {
+                ...m,
+                content: String(m.role || ''),
+                role: 'user',
+                tokens_used: typeof m.content === 'number' ? m.content : 10,
+              };
+            }
+            return {
+              ...m,
+              content: String(m.content ?? ''),
+              role: m.role,
+            };
+          });
+        }
       }
     } catch (e) {
       console.warn('Failed to load storage from disk, using clean memory store:', e);
@@ -515,16 +534,53 @@ class UniversalStore {
 
     // INSERT INTO promo_codes
     if (upper.includes('INSERT INTO PROMO_CODES')) {
-      const [id, code, tokens, code_type, max_activations, current_activations, is_active, created_at] = params;
+      let id: string;
+      let code: string;
+      let tokens: number;
+      let code_type: string;
+      let max_activations: number;
+      let current_activations = 0;
+      let expires_at: string | null = null;
+      let is_active = 1;
+      let created_at = new Date().toISOString();
+
+      if (params.length === 7) {
+        // [id, code, tokenAmount, codeType, activationsLimit, expiresAt, now]
+        id = params[0];
+        code = String(params[1] || '').toUpperCase();
+        tokens = Number(params[2]) || 0;
+        code_type = String(params[3] || 'single');
+        max_activations = Number(params[4]) || 1;
+        expires_at = params[5] || null;
+        created_at = params[6] || created_at;
+      } else if (params.length === 5) {
+        // Seeding: [id, code, tokens, max_activations, now]
+        id = params[0];
+        code = String(params[1] || '').toUpperCase();
+        tokens = Number(params[2]) || 0;
+        code_type = 'multi';
+        max_activations = Number(params[3]) || 100;
+        created_at = params[4] || created_at;
+      } else {
+        id = params[0];
+        code = String(params[1] || '').toUpperCase();
+        tokens = Number(params[2]) || 0;
+        code_type = String(params[3] || 'single');
+        max_activations = Number(params[4]) || 1;
+        current_activations = Number(params[5]) || 0;
+        is_active = params[6] !== undefined ? (params[6] ? 1 : 0) : 1;
+        created_at = params[7] || created_at;
+      }
+
       this.data.promo_codes.push({
         id,
         code,
         tokens,
         code_type,
         max_activations,
-        current_activations: current_activations || 0,
-        expires_at: null,
-        is_active: is_active ?? 1,
+        current_activations,
+        expires_at,
+        is_active,
         created_at,
       });
       this.save();
@@ -588,8 +644,43 @@ class UniversalStore {
 
     // INSERT INTO chat_messages
     if (upper.includes('INSERT INTO CHAT_MESSAGES')) {
-      const [id, session_id, user_id, role, content, tokens_used, created_at] = params;
-      this.data.chat_messages.push({ id, session_id, user_id, role, content, tokens_used: tokens_used || 0, created_at });
+      let id: string;
+      let session_id: string;
+      let user_id: string;
+      let role: 'user' | 'assistant' | 'system';
+      let content: string;
+      let tokens_used = 0;
+      let created_at = new Date().toISOString();
+
+      if (params.length === 6) {
+        // Query has literal 'user' or 'assistant' in SQL
+        id = params[0];
+        session_id = params[1];
+        user_id = params[2];
+        role = upper.includes("'ASSISTANT'") ? 'assistant' : upper.includes("'SYSTEM'") ? 'system' : 'user';
+        content = String(params[3] ?? '');
+        tokens_used = Number(params[4]) || 0;
+        created_at = params[5] || created_at;
+      } else {
+        id = params[0];
+        session_id = params[1];
+        user_id = params[2];
+        const rawRole = String(params[3] || 'user').toLowerCase();
+        role = rawRole === 'assistant' ? 'assistant' : rawRole === 'system' ? 'system' : 'user';
+        content = String(params[4] ?? '');
+        tokens_used = Number(params[5]) || 0;
+        created_at = params[6] || created_at;
+      }
+
+      this.data.chat_messages.push({
+        id,
+        session_id,
+        user_id,
+        role,
+        content: String(content ?? ''),
+        tokens_used: tokens_used || 0,
+        created_at,
+      });
       this.save();
       return { changes: 1 };
     }

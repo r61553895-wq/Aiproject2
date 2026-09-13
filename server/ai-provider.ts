@@ -47,17 +47,20 @@ export function httpsRequest(
   options: {
     method?: string;
     headers?: Record<string, string>;
-    body?: string;
+    body?: string | Buffer;
     rejectUnauthorized?: boolean;
     timeout?: number;
   }
 ): Promise<{ status: number; text: string; data?: any }> {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
-    const bodyData = options.body || '';
+    const bodyBuffer = Buffer.isBuffer(options.body)
+      ? options.body
+      : Buffer.from(options.body || '', 'utf-8');
+
     const headers: Record<string, string> = { ...(options.headers || {}) };
-    if (bodyData && !headers['Content-Length']) {
-      headers['Content-Length'] = String(Buffer.byteLength(bodyData));
+    if (bodyBuffer.length > 0 && !headers['Content-Length']) {
+      headers['Content-Length'] = String(bodyBuffer.length);
     }
 
     const req = https.request(
@@ -100,10 +103,11 @@ export function httpsRequest(
       reject(err);
     });
 
-    if (bodyData) {
-      req.write(bodyData);
+    if (bodyBuffer.length > 0) {
+      req.end(bodyBuffer);
+    } else {
+      req.end();
     }
-    req.end();
   });
 }
 
@@ -192,12 +196,36 @@ async function callGigaChat(
     accessToken = await getOAuthToken(activeKey);
   }
 
+  const safePrompt = String(systemPrompt || 'Ты — Grokson, умный, лаконичный и доброжелательный персональный AI-помощник. Отвечай подробно, профессионально и по делу.');
+  const sanitizedMessages = (messages || [])
+    .filter((m) => m && (m.content !== undefined || m.role !== undefined))
+    .map((m) => {
+      let role: 'user' | 'assistant' | 'system' = 'user';
+      let content = '';
+      if (m.role === 'assistant') {
+        role = 'assistant';
+        content = String(m.content ?? '').trim();
+      } else if (m.role === 'system') {
+        role = 'system';
+        content = String(m.content ?? '').trim();
+      } else if (m.role === 'user') {
+        role = 'user';
+        content = String(m.content ?? '').trim();
+      } else {
+        role = 'user';
+        content = String(m.role || m.content || '').trim();
+      }
+      return { role, content: content || '...' };
+    });
+
+  // GigaChat expects at least one user message
+  if (sanitizedMessages.length === 0) {
+    sanitizedMessages.push({ role: 'user', content: 'Привет' });
+  }
+
   const gigaMessages = [
-    { role: 'system', content: systemPrompt },
-    ...messages.map((m) => ({
-      role: m.role === 'assistant' ? 'assistant' : m.role === 'system' ? 'system' : 'user',
-      content: m.content,
-    })),
+    { role: 'system', content: safePrompt },
+    ...sanitizedMessages,
   ];
 
   const chatBody = JSON.stringify({
@@ -210,7 +238,7 @@ async function callGigaChat(
   const res = await httpsRequest('https://gigachat.devices.sberbank.ru/api/v1/chat/completions', {
     method: 'POST',
     headers: {
-      'Content-Type': 'application/json',
+      'Content-Type': 'application/json; charset=utf-8',
       'Accept': 'application/json',
       'Authorization': `Bearer ${accessToken}`,
     },
@@ -220,7 +248,7 @@ async function callGigaChat(
 
   if (res.status >= 200 && res.status < 300 && res.data?.choices?.[0]?.message?.content) {
     const answer = res.data.choices[0].message.content;
-    const promptTokens = estimateTokens(messages.map((m) => m.content).join(' '));
+    const promptTokens = estimateTokens(messages.map((m) => String(m.content)).join(' '));
     const tokensUsed = res.data.usage?.total_tokens || promptTokens + estimateTokens(answer);
     return {
       content: answer,
@@ -240,12 +268,15 @@ async function callOpenAi(
   systemPrompt: string,
   options?: { temperature?: number; maxTokens?: number }
 ): Promise<GenerateResult> {
+  const safePrompt = String(systemPrompt || 'Ты — Grokson, умный, лаконичный и доброжелательный персональный AI-помощник.');
   const openAiMessages = [
-    { role: 'system', content: systemPrompt },
-    ...messages.map((m) => ({
-      role: m.role === 'assistant' ? 'assistant' : m.role === 'system' ? 'system' : 'user',
-      content: m.content,
-    })),
+    { role: 'system', content: safePrompt },
+    ...messages
+      .filter((m) => m && m.content !== undefined && m.content !== null)
+      .map((m) => ({
+        role: m.role === 'assistant' ? 'assistant' : m.role === 'system' ? 'system' : 'user',
+        content: String(m.content),
+      })),
   ];
 
   const chatBody = JSON.stringify({
@@ -258,7 +289,7 @@ async function callOpenAi(
   const res = await httpsRequest('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
     headers: {
-      'Content-Type': 'application/json',
+      'Content-Type': 'application/json; charset=utf-8',
       'Authorization': `Bearer ${activeKey}`,
     },
     body: chatBody,
@@ -266,7 +297,7 @@ async function callOpenAi(
 
   if (res.status >= 200 && res.status < 300 && res.data?.choices?.[0]?.message?.content) {
     const answer = res.data.choices[0].message.content;
-    const promptTokens = estimateTokens(messages.map((m) => m.content).join(' '));
+    const promptTokens = estimateTokens(messages.map((m) => String(m.content)).join(' '));
     const tokensUsed = res.data.usage?.total_tokens || promptTokens + estimateTokens(answer);
     return {
       content: answer,
@@ -286,17 +317,20 @@ async function callGemini(
   systemPrompt: string,
   options?: { temperature?: number; maxTokens?: number }
 ): Promise<GenerateResult> {
+  const safePrompt = String(systemPrompt || 'Ты — Grokson, умный, лаконичный и доброжелательный персональный AI-помощник.');
   const ai = new GoogleGenAI({ apiKey: activeKey });
-  const contents = messages.map((m) => ({
-    role: m.role === 'assistant' ? 'model' : 'user',
-    parts: [{ text: m.content }],
-  }));
+  const contents = messages
+    .filter((m) => m && m.content !== undefined && m.content !== null)
+    .map((m) => ({
+      role: m.role === 'assistant' ? 'model' : 'user',
+      parts: [{ text: String(m.content) }],
+    }));
 
   const response = await ai.models.generateContent({
     model: 'gemini-2.5-flash',
     contents,
     config: {
-      systemInstruction: systemPrompt,
+      systemInstruction: safePrompt,
       temperature: options?.temperature ?? 0.7,
       maxOutputTokens: options?.maxTokens ?? 2048,
     },
@@ -307,7 +341,7 @@ async function callGemini(
     throw new Error('Gemini API не вернул текст ответа');
   }
 
-  const promptTokens = estimateTokens(messages.map((m) => m.content).join(' '));
+  const promptTokens = estimateTokens(messages.map((m) => String(m.content)).join(' '));
   const tokensUsed = promptTokens + estimateTokens(answer);
   return {
     content: answer,
